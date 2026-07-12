@@ -1,6 +1,7 @@
 import sys
 from hashtable import HashTable
 from persistence import Log
+from store import new_string, STRING
 
 store = HashTable()
 log = Log("data.db")
@@ -10,13 +11,13 @@ def apply_record(record):
     """Re-apply one logged record to memory. Does NOT write to the log."""
     action = record[0]
     if action == "SET":
-        store.set(record[1], record[2])
+        store.set(record[1], new_string(record[2]))   # wrap it
     elif action == "DEL":
         store.delete(record[1])
 
 
-log.replay(apply_record)   # rebuild state from last run
-log.open_for_append()      # then start appending new writes
+log.replay(apply_record)
+log.open_for_append()
 
 for line in sys.stdin:
     line = line.rstrip("\n")
@@ -29,23 +30,25 @@ for line in sys.stdin:
     if command == "SET":
         key = parts[1]
         value = parts[2]
-        store.set(key, value)
-        log.append(["SET", key, value])      # <-- log it
+        store.set(key, new_string(value))          # wrap before storing
+        log.append(["SET", key, value])
         print("OK")
 
     elif command == "GET":
         key = parts[1]
-        value = store.get(key)
-        if value is None:
+        item = store.get(key)                      # this is a Value now, not a str
+        if item is None:
             print("(nil)")
+        elif item.vtype != STRING:                 # is it actually a string?
+            print("ERR wrong type")
         else:
-            print(value)
+            print(item.data)                       # unwrap to get the text
 
     elif command == "DEL":
         key = parts[1]
         removed = store.delete(key)
         if removed:
-            log.append(["DEL", key])         # <-- only log a real deletion
+            log.append(["DEL", key])
             print("1")
         else:
             print("0")
@@ -59,13 +62,16 @@ for line in sys.stdin:
 
     elif command == "INCR" or command == "DECR":
         key = parts[1]
-        current = store.get(key)
+        item = store.get(key)
 
-        if current is None:
+        if item is None:
             number = 0
+        elif item.vtype != STRING:
+            print("ERR wrong type")
+            continue
         else:
             try:
-                number = int(current)
+                number = int(item.data)            # unwrap, then convert
             except ValueError:
                 print("ERR value is not an integer")
                 continue
@@ -75,8 +81,8 @@ for line in sys.stdin:
         else:
             number = number - 1
 
-        store.set(key, str(number))
-        log.append(["SET", key, str(number)])   # <-- log the RESULT as a SET
+        store.set(key, new_string(str(number)))    # wrap before storing
+        log.append(["SET", key, str(number)])
         print(number)
 
     elif command == "EXIT":
