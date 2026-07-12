@@ -6,6 +6,9 @@ from store import new_string, new_hash, new_list, STRING, HASH, LIST
 
 store = HashTable()
 log = Log("data.db")
+in_transaction = False
+txn_buffer = []      # log records waiting to be committed
+snapshot = None      # copy of the store, for rollback
 
 
 def apply_record(record):
@@ -47,6 +50,12 @@ def get_live(key):
         store.delete(key)      # it's dead -- clean it up now
         return None
     return item
+def write_log(record):
+    """Log a change -- or buffer it if we're inside a transaction."""
+    if in_transaction:
+        txn_buffer.append(record)
+    else:
+        log.append(record)
 
 
 log.replay(apply_record)       # rebuild state from last run
@@ -68,7 +77,7 @@ for line in sys.stdin:
         key = parts[1]
         value = parts[2]
         store.set(key, new_string(value))
-        log.append(["SET", key, value])
+        write_log(["SET", key, value])
         print("OK")
 
     elif command == "GET":
@@ -84,7 +93,7 @@ for line in sys.stdin:
     elif command == "DEL":
         key = parts[1]
         if get_live(key) is not None and store.delete(key):
-            log.append(["DEL", key])
+            write_log(["DEL", key])
             print("1")
         else:
             print("0")
@@ -105,7 +114,7 @@ for line in sys.stdin:
             key = parts[i]
             value = parts[i + 1]
             store.set(key, new_string(value))
-            log.append(["SET", key, value])
+            write_log(["SET", key, value])
             i = i + 2
         print("OK")
 
@@ -139,7 +148,7 @@ for line in sys.stdin:
             number = number - 1
 
         store.set(key, new_string(str(number)))
-        log.append(["SET", key, str(number)])
+        write_log(["SET", key, str(number)])
         print(number)
 
     elif command == "EXPIRE":
@@ -151,7 +160,7 @@ for line in sys.stdin:
         else:
             deadline = time.time() + seconds   # absolute time it dies
             item.expires_at = deadline
-            log.append(["EXPIRE", key, deadline])
+            write_log(["EXPIRE", key, deadline])
             print("1")
 
     elif command == "TTL":
@@ -195,7 +204,7 @@ for line in sys.stdin:
             continue
 
         item.data.set(field, value)
-        log.append(["HSET", key, field, value])
+        write_log(["HSET", key, field, value])
         print("1")
 
     elif command == "HGET":
@@ -247,7 +256,7 @@ for line in sys.stdin:
         else:
             item.data.append(value)      # append = the back
 
-        log.append([command, key, value])
+        write_log([command, key, value])
         print(len(item.data))
 
     elif command == "LRANGE":
@@ -281,8 +290,39 @@ for line in sys.stdin:
 
     elif command == "FLUSHDB":
         store.clear()
-        log.append(["FLUSHDB"])
+        write_log(["FLUSHDB"])
         print("OK")
+    elif command == "BEGIN":
+        if in_transaction:
+            print("ERR already in a transaction")
+        else:
+            snapshot = HashTable()
+            for key, item in store.items():
+                snapshot.set(key, item.clone())   # deep copy every value
+            in_transaction = True
+            txn_buffer = []
+            print("OK")
+
+    elif command == "COMMIT":
+        if not in_transaction:
+            print("ERR no transaction in progress")
+        else:
+            for record in txn_buffer:     # NOW write them to disk
+                log.append(record)
+            in_transaction = False
+            txn_buffer = []
+            snapshot = None
+            print("OK")
+
+    elif command == "ABORT":
+        if not in_transaction:
+            print("ERR no transaction in progress")
+        else:
+            store = snapshot              # restore the old state
+            in_transaction = False
+            txn_buffer = []               # discard the buffered writes
+            snapshot = None
+            print("OK")
 
     elif command == "EXIT":
         break
