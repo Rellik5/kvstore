@@ -8,24 +8,22 @@ class Log:
         self._file = None
 
     def open_for_append(self):
-        # "a" = append mode: writes go to the end, existing content is kept
         self._file = open(self._path, "a")
 
     def append(self, record):
-        # record is a list like ["SET", "name", "roman"]
         self._file.write(json.dumps(record) + "\n")
-        self._file.flush()                  # push out of Python's buffer
-        os.fsync(self._file.fileno())       # force the OS to write to disk
+        self._file.flush()
+        os.fsync(self._file.fileno())
 
     def replay(self, apply_function):
         if not os.path.exists(self._path):
-            return                          # first run, nothing to replay
+            return
         with open(self._path, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                record = json.loads(line)   # text back into a list
+                record = json.loads(line)
                 apply_function(record)
 
     def close(self):
