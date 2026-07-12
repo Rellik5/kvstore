@@ -46,3 +46,6 @@ class HashTable:
             if bucket is not None:
                 for pair in bucket:
                     yield pair[0], pair[1]
+    def clear(self):
+        """Remove everything."""
+        self._buckets = [None] * self._capacity

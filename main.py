@@ -29,7 +29,8 @@ def apply_record(record):
             item.data.insert(0, record[2])
         else:
             item.data.append(record[2])
-
+    elif action == "FLUSHDB":
+        store.clear()
 
 log.replay(apply_record)   # rebuild state from last run
 log.open_for_append()      # then start appending new writes
@@ -196,7 +197,32 @@ for line in sys.stdin:
                     stop = n - 1        # don't run off the back
                 for i in range(start, stop + 1):   # +1 because stop is inclusive
                     print(data[i])
+    elif command == "MSET":
+        if len(parts) < 3 or len(parts) % 2 == 0:
+            print("ERR wrong number of arguments")
+            continue
+        i = 1
+        while i < len(parts):           # walk args two at a time
+            key = parts[i]
+            value = parts[i + 1]
+            store.set(key, new_string(value))
+            log.append(["SET", key, value])
+            i = i + 2
+        print("OK")
 
+    elif command == "MGET":
+        for key in parts[1:]:           # every arg after the command
+            item = store.get(key)
+            if item is None or item.vtype != STRING:
+                print("(nil)")
+            else:
+                print(item.data)
+
+    elif command == "FLUSHDB":
+        store.clear()
+        log.append(["FLUSHDB"])
+        print("OK")
+    
     elif command == "EXIT":
         break
 
