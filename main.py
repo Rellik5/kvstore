@@ -1,7 +1,7 @@
 import sys
 from hashtable import HashTable
 from persistence import Log
-from store import new_string, new_hash, STRING, HASH
+from store import new_string, new_hash, new_list, STRING, HASH, LIST
 
 store = HashTable()
 log = Log("data.db")
@@ -20,6 +20,15 @@ def apply_record(record):
             item = new_hash()
             store.set(record[1], item)
         item.data.set(record[2], record[3])
+    elif action == "LPUSH" or action == "RPUSH":
+        item = store.get(record[1])
+        if item is None or item.vtype != LIST:
+            item = new_list()
+            store.set(record[1], item)
+        if action == "LPUSH":
+            item.data.insert(0, record[2])
+        else:
+            item.data.append(record[2])
 
 
 log.replay(apply_record)   # rebuild state from last run
@@ -139,6 +148,54 @@ for line in sys.stdin:
                 found = True
             if not found:
                 print("(empty)")
+    elif command == "LPUSH" or command == "RPUSH":
+        key = parts[1]
+        value = parts[2]
+        item = store.get(key)
+
+        if item is None:
+            item = new_list()           # first push -- create the list
+            store.set(key, item)
+        elif item.vtype != LIST:
+            print("ERR wrong type")
+            continue
+
+        if command == "LPUSH":
+            item.data.insert(0, value)  # insert at position 0 = the front
+        else:
+            item.data.append(value)     # append = the back
+
+        log.append([command, key, value])
+        print(len(item.data))           # return the new length
+
+    elif command == "LRANGE":
+        key = parts[1]
+        start = int(parts[2])
+        stop = int(parts[3])
+        item = store.get(key)
+
+        if item is None:
+            print("(empty)")
+        elif item.vtype != LIST:
+            print("ERR wrong type")
+        else:
+            data = item.data
+            n = len(data)
+
+            if start < 0:               # -1 means "last", so convert it
+                start = n + start
+                if start < 0:
+                    start = 0           # don't run off the front
+            if stop < 0:
+                stop = n + stop
+
+            if start >= n or start > stop:
+                print("(empty)")
+            else:
+                if stop > n - 1:
+                    stop = n - 1        # don't run off the back
+                for i in range(start, stop + 1):   # +1 because stop is inclusive
+                    print(data[i])
 
     elif command == "EXIT":
         break
