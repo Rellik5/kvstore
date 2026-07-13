@@ -1,0 +1,23 @@
+# Simple Key-Value Store
+
+I built a simple key-value database with a CLI, which was built from scratch without using pythons built in dict. Supports strings, hashes, lists, counters, key expiry, range
+queries, and transactions. The data survives a restart due to there being an append-only log.
+
+Author: Roman — EUID `rms0465`
+
+## Design
+
+The hashtable keys hash to a to a bucket index, collisions land in a small per-bucket list that gets searched linearly, 
+and the table doubles once it's 75% full so those lists stay short.
+
+Persistence is an append-only log. Every write appends one line of JSON to data.db and nothing already written is ever modified, 
+so a crash mid-write can only corrupt the final line.
+
+ Startup replays the file top to bottom in order, and since newest-write-wins, replay lands in exactly the prior state.
+
+ Each key carries its deadline, and every read routes through _live(), which checks the clock and deletes the key if it's past due.
+
+Transactions are a snapshot plus a buffer: BEGIN deep-copies the store and starts holding log records in memory instead of writing them, COMMIT flushes them to disk, 
+and ABORT restores the copy and discards them.
+
+ Writes still hit memory immediately, so you can read your own changes inside a transaction.
