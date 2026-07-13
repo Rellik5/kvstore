@@ -63,7 +63,6 @@ class Database:
         self._buffer: List[Record] = []
         self._snapshot: Optional[HashTable] = None
 
-   
     def load(self) -> None:
         """Rebuild the index from the log, then discard expired keys."""
         self._log.replay(self._apply)
@@ -117,7 +116,6 @@ class Database:
         elif action == "FLUSHDB":
             self._index.clear()
 
-    
     def _live(self, key: str) -> Optional[Value]:
         """Look up a key, treating an expired one as though it were absent.
 
@@ -147,7 +145,6 @@ class Database:
         else:
             self._log.append(record)
 
-    
     def set(self, key: str, value: str) -> List[str]:
         """Store a string value, replacing anything previously held."""
         self._index.set(key, new_string(value))
@@ -208,7 +205,6 @@ class Database:
         self._record(["SET", key, updated])
         return [updated]
 
-    
     def delete(self, key: str) -> List[str]:
         """Remove a key, reporting 1 if one was removed and 0 otherwise."""
         if self._live(key) is not None and self._index.delete(key):
@@ -265,7 +261,6 @@ class Database:
                 matches.append(key)
         return sorted(matches) + [END]
 
-    
     def hset(self, key: str, field: str, value: str) -> List[str]:
         """Set a field inside a hash, creating the hash if it is new."""
         item = self._live(key)
@@ -300,7 +295,6 @@ class Database:
         lines = ["%s %s" % (field, value) for field, value in item.data.items()]
         return lines + [END]
 
-    
     def push(self, key: str, value: str, front: bool) -> List[str]:
         """Add a value to the front or back of a list, returning its length."""
         item = self._live(key)
@@ -360,14 +354,12 @@ class Database:
             return [END]
         return list(data[start:stop + 1]) + [END]
 
-    
     def flush(self) -> List[str]:
         """Delete every key in the database."""
         self._index.clear()
         self._record(["FLUSHDB"])
         return [OK]
 
-    
     def begin(self) -> List[str]:
         """Open a transaction, snapshotting the index so ABORT can undo it.
 
