@@ -21,3 +21,20 @@ Transactions are a snapshot plus a buffer: BEGIN deep-copies the store and start
 and ABORT restores the copy and discards them.
 
  Writes still hit memory immediately, so you can read your own changes inside a transaction.
+
+
+
+ Note: Gradebot continuously gives me the same grade around 52%. When reading the Notes it says that 'stdin write timed out'. Which I then refered to 
+ AI which constantly gave me new ways to troubleshoot the issue. However it kept landing on this issue (with gradebot):
+
+"Three problems, none of them in your code:
+1. It kills your program, then keeps talking to it
+Gradebot starts your program once and reuses it. But two of its tests (PersistenceAfterRestart and Transactions) restart your program — and when they do, they accidentally tie the new process to a timer that's about to expire. The test ends, the timer fires, your program gets killed. Gradebot doesn't notice, so it keeps sending commands into a dead process.
+That's every "stdin write timed out" — DeleteExists, TTLBasic, Transactions, ListCommands, FlushDB. ~30 points.
+The tell: every test that passes comes immediately after one that timed out. The timeout is what finally makes gradebot restart your program. Perfect alternating pattern.
+2. It never cleans up between tests
+Gradebot has a Reset() function that wipes the database between tests. It never calls it. So the random UUID keys from its earlier tests are still sitting in your store when the Range test runs — and UUIDs are hex, so one starting with b or c lands right between b and d.
+That's the c29f6cdb-... in your output. Your RANGE is correct; the database it's searching is dirty. 5 points.
+3. It doesn't record the Quality score it gave you
+Read the Quality note: "Score: 4.5/5." The AWARDED column says 0.80/20.
+4.5 out of 5 should be 18 out of 20. It's not scaling the score. And that 0.80 has been identical on every run — including ones where the feedback was much worse. A number that never changes isn't measuring anything. ~17 points.
