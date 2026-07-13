@@ -67,3 +67,18 @@ def test_range_ends_with_end_marker(tmp_path):
 def test_malformed_input_does_not_crash(tmp_path):
     out = run(["GET", "BOGUS", "SET k v", "GET k", "EXIT"], tmp_path)
     assert out[-1] == "v"      # process survived the bad commands
+
+
+def test_expire_uses_milliseconds(tmp_path):
+    out = run(["SET k v", "EXPIRE k 50", "GET k", "EXIT"], tmp_path)
+    assert out == ["OK", "1", "v"]          # 50ms TTL, not yet expired
+
+
+def test_lpop_removes_from_front(tmp_path):
+    out = run(["RPUSH l a", "RPUSH l b", "LPOP l", "LRANGE l 0 -1", "EXIT"], tmp_path)
+    assert out == ["1", "2", "a", "b", "END"]
+
+
+def test_range_empty_bounds_are_unbounded(tmp_path):
+    out = run(['MSET a 1 b 2 c 3', 'RANGE "" b', "EXIT"], tmp_path)
+    assert out == ["OK", "a", "b", "END"]

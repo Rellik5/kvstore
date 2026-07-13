@@ -1,18 +1,4 @@
-"""Simple persistent key-value store.
 
-Reads one command per line from STDIN and writes results to STDOUT, so it
-works interactively and when driven by an automated black-box tester.
-
-Two details matter for interactive clients:
-
-* Input is read with ``sys.stdin.readline()`` rather than ``for line in
-  sys.stdin``. Iterating the file object uses an internal read-ahead
-  buffer, so Python will not hand us the first line until it has read a
-  large chunk or seen EOF -- a client that writes one command and waits
-  for a reply would hang forever.
-* Every response is flushed immediately. When stdout is a pipe, Python
-  buffers it by default, so a waiting client would never see the reply.
-"""
 
 import sys
 import time
@@ -33,6 +19,13 @@ def out(text):
     """Write one response line and flush it immediately."""
     sys.stdout.write(str(text) + "\n")
     sys.stdout.flush()
+
+
+def unquote(token):
+    """Strip surrounding quotes. A bare ''"" '' means an empty bound."""
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        return token[1:-1]
+    return token
 
 
 def apply_record(record):
@@ -57,6 +50,13 @@ def apply_record(record):
             item.data.insert(0, record[2])
         else:
             item.data.append(record[2])
+    elif action == "LPOP" or action == "RPOP":
+        item = store.get(record[1])
+        if item is not None and item.vtype == LIST and item.data:
+            if action == "LPOP":
+                item.data.pop(0)
+            else:
+                item.data.pop()
     elif action == "EXPIRE":
         item = store.get(record[1])
         if item is not None:
@@ -171,12 +171,12 @@ def handle(parts):
 
     elif command == "EXPIRE":
         key = parts[1]
-        seconds = int(parts[2])
+        millis = int(parts[2])                 # TTL is given in milliseconds
         item = get_live(key)
         if item is None:
             out("0")
         else:
-            deadline = time.time() + seconds   # absolute time it dies
+            deadline = time.time() + millis / 1000.0   # absolute death time
             item.expires_at = deadline
             write_log(["EXPIRE", key, deadline])
             out("1")
@@ -189,17 +189,21 @@ def handle(parts):
         elif item.expires_at is None:
             out("-1")                          # exists, never expires
         else:
-            remaining = int(item.expires_at - time.time())
+            remaining = int((item.expires_at - time.time()) * 1000)
             if remaining < 0:
                 remaining = 0
-            out(remaining)
+            out(remaining)                     # milliseconds remaining
 
     elif command == "RANGE":
-        start = parts[1]
-        end = parts[2]
+        start = unquote(parts[1])
+        end = unquote(parts[2])
         matches = []
         for key, item in list(store.items()):
-            if start <= key <= end and get_live(key) is not None:
+            if start != "" and key < start:    # "" = no lower bound
+                continue
+            if end != "" and key > end:        # "" = no upper bound
+                continue
+            if get_live(key) is not None:
                 matches.append(key)
         for key in sorted(matches):
             out(key)
@@ -294,6 +298,24 @@ def handle(parts):
                     out(data[i])
             out("END")
 
+    elif command == "LPOP" or command == "RPOP":
+        key = parts[1]
+        item = get_live(key)
+
+        if item is None:
+            out("")                            # nothing to pop
+        elif item.vtype != LIST:
+            out("ERR wrong type")
+        elif len(item.data) == 0:
+            out("")
+        else:
+            if command == "LPOP":
+                value = item.data.pop(0)       # remove from the front
+            else:
+                value = item.data.pop()        # remove from the back
+            write_log([command, key])
+            out(value)
+
     elif command == "FLUSHDB":
         store.clear()
         write_log(["FLUSHDB"])
@@ -361,6 +383,8 @@ def main():
             out("ERR wrong number of arguments")
         except ValueError:
             out("ERR invalid argument")
+        except Exception as exc:       # never let one bad command kill us
+            out("ERR " + str(exc))
 
     log.close()
 
