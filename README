@@ -35,6 +35,3 @@ The tell: every test that passes comes immediately after one that timed out. The
 2. It never cleans up between tests
 Gradebot has a Reset() function that wipes the database between tests. It never calls it. So the random UUID keys from its earlier tests are still sitting in your store when the Range test runs — and UUIDs are hex, so one starting with b or c lands right between b and d.
 That's the c29f6cdb-... in your output. Your RANGE is correct; the database it's searching is dirty. 5 points.
-3. It doesn't record the Quality score it gave you
-Read the Quality note: "Score: 4.5/5." The AWARDED column says 0.80/20.
-4.5 out of 5 should be 18 out of 20. It's not scaling the score. And that 0.80 has been identical on every run — including ones where the feedback was much worse. A number that never changes isn't measuring anything. ~17 points.
