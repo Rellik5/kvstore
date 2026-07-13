@@ -1,38 +1,95 @@
+"""Typed values held by the key-value store.
+
+A key does not simply map to a string: it may hold a string, a hash of
+field/value pairs, or an ordered list. Every stored item is therefore
+wrapped in a :class:`Value`, which carries the data alongside a tag naming
+its type and an optional expiry timestamp.
+
+The tag is what lets each command validate its input before acting. HGET
+on a key holding a list, for example, is a type error rather than a
+silently wrong answer.
+
+A hash's fields are themselves stored in a :class:`HashTable` -- the same
+index structure the top-level store uses -- so no built-in dictionary is
+required at any level.
+"""
+
+from typing import List, Optional, Union
+
 from hashtable import HashTable
 
-# the three kinds of things a key can hold
+# Type tags. A key holds exactly one of these kinds of value.
 STRING = "string"
 HASH = "hash"
 LIST = "list"
 
+# The concrete payload a Value can carry, one per type tag above.
+Payload = Union[str, HashTable, List[str]]
+
 
 class Value:
-    """A stored value plus a tag saying what type it is."""
+    """A stored value, tagged with its type and an optional expiry.
 
-    def __init__(self, vtype, data, expires_at=None):
-        self.vtype = vtype           # "string", "hash", or "list"
-        self.data = data             # a str, a HashTable, or a Python list
-        self.expires_at = expires_at  # absolute unix time, or None = never
+    Attributes:
+        vtype: One of ``STRING``, ``HASH``, or ``LIST``.
+        data: The payload -- a ``str``, a ``HashTable``, or a ``list``.
+        expires_at: Absolute Unix timestamp at which the key dies, or
+            None if it never expires. Storing an absolute deadline rather
+            than a duration is what makes expiry survive a restart: a
+            replayed log records *when* the key dies, not how long it had
+            left when the command ran.
+    """
 
-    def clone(self):
-        """Deep copy, so a snapshot can't be mutated by later changes."""
+    def __init__(
+        self,
+        vtype: str,
+        data: Payload,
+        expires_at: Optional[float] = None,
+    ) -> None:
+        self.vtype = vtype
+        self.data = data
+        self.expires_at = expires_at
+
+    def clone(self) -> "Value":
+        """Return an independent deep copy of this value.
+
+        Transactions snapshot the whole store on BEGIN so that ABORT can
+        restore it. A shallow copy would be useless: the snapshot would
+        share the same underlying hash or list object, so writes made
+        during the transaction would mutate the snapshot too and there
+        would be nothing to roll back to.
+        """
         if self.vtype == HASH:
-            copy = HashTable()
-            for field, val in self.data.items():
-                copy.set(field, val)          # fields are plain strings
-            return Value(HASH, copy, self.expires_at)
+            fields = HashTable()
+            for field, field_value in self.data.items():
+                fields.set(field, field_value)   # fields are plain strings
+            return Value(HASH, fields, self.expires_at)
+
         if self.vtype == LIST:
-            return Value(LIST, list(self.data), self.expires_at)   # new list
+            return Value(LIST, list(self.data), self.expires_at)
+
         return Value(STRING, self.data, self.expires_at)
 
+    def __repr__(self) -> str:
+        """Return a debugging representation naming the type and payload."""
+        return "Value(%s, %r)" % (self.vtype, self.data)
 
-def new_string(text):
+
+def new_string(text: str) -> Value:
+    """Create a value holding a plain string."""
     return Value(STRING, text)
 
 
-def new_hash():
+def new_hash() -> Value:
+    """Create an empty hash, whose fields live in their own HashTable."""
     return Value(HASH, HashTable())
 
 
-def new_list():
+def new_list() -> Value:
+    """Create an empty ordered list."""
     return Value(LIST, [])
+
+
+def is_type(item: Optional[Value], vtype: str) -> bool:
+    """Return True if ``item`` exists and carries the given type tag."""
+    return item is not None and item.vtype == vtype

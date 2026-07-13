@@ -1,0 +1,148 @@
+# Simple Key-Value Store
+
+A key-value database with a command-line interface. Built from scratch for
+CSCE 4350. Supports strings, hashes, lists, counters, key expiry, range
+queries, and transactions. Data survives a restart.
+
+**Author:** Roman — EUID `rms0465`
+
+## Design
+
+### The hash table is my own
+
+The project doesn't let you use Python's built-in `dict`, so `hashtable.py`
+is a hash table I wrote. A key is hashed to a bucket index. Two keys can
+land in the same bucket, so each bucket holds a small list of `[key, value]`
+pairs that gets searched one by one. The table doubles in size once it's
+75% full, which keeps those lists short.
+
+Setting a key that already exists overwrites it. That's what gives you
+last-write-wins.
+
+A hash's fields are stored in another HashTable, so I reuse the same class
+at both levels.
+
+### Persistence: an append-only log
+
+Every write gets appended to `data.db` as one line of JSON:
+
+```
+["SET", "user:1", "alice"]
+["EXPIRE", "user:1", 1751900000.0]
+["FLUSHDB"]
+```
+
+Nothing already in the file is ever changed. Only added. So if the program
+dies mid-write, the worst that happens is the last line is garbage, and
+everything before it is fine. A broken line gets skipped on load.
+
+On startup I read the file top to bottom and re-apply every record. Since
+they're applied in order and the newest write wins, I end up in exactly the
+state I was in before.
+
+Two things I had to get right:
+
+- **EXPIRE logs the deadline, not the duration.** If I logged "expires in
+  60s" and replayed the log a day later, the key would get a fresh 60
+  seconds. So I log *when* it dies.
+- **INCR logs a SET with the result.** I record what the value became, not
+  that an increment happened. Replay never has to do math, so it can't
+  disagree with what actually happened.
+
+Records are JSON arrays, not objects, so the file format doesn't depend on
+a map type either.
+
+### Expiry is checked on read, not on a timer
+
+There's no background thread cleaning up dead keys. Each key stores its
+deadline, and every read goes through `_live()`, which checks the clock and
+deletes the key if it's past due. Nothing else can see a dead key because
+nothing else reads keys directly.
+
+### Transactions: snapshot + buffer
+
+`BEGIN` copies the whole store and starts holding log records in memory
+instead of writing them. `COMMIT` writes them out. `ABORT` puts the copy
+back and throws the records away.
+
+Both parts matter. The copy has to be a *deep* copy, or changes made during
+the transaction would also change the copy and there'd be nothing to roll
+back to. And the log writes have to be held back, or an aborted
+transaction's changes would already be on disk and replay would bring them
+back.
+
+Writes hit memory right away, so you can read your own changes inside a
+transaction.
+
+## Files
+
+```
+main.py           the command loop, parsing, and dispatch
+hashtable.py      the hash table used as the index
+store.py          values: string, hash, or list, plus optional expiry
+persistence.py    the append-only log
+tests/            unit tests and black-box CLI tests
+.github/workflows/ci.yml   runs flake8 + pytest on every push
+```
+
+## Running
+
+```bash
+python3 main.py
+```
+
+Type one command per line. It also reads piped input, which is how the
+automated tester drives it:
+
+```bash
+printf 'SET greeting hello\nGET greeting\nEXIT\n' | python3 main.py
+```
+
+Data goes in `data.db`, which is git-ignored since it's runtime data, not
+source.
+
+## Commands
+
+| Command | Result |
+|---|---|
+| `SET <key> <value>` | `OK` |
+| `GET <key>` | the value, or an empty line if missing |
+| `DEL <key>` | `1` if removed, `0` if it wasn't there |
+| `EXISTS <key>` | `1` / `0` |
+| `MSET <k> <v> ...` | `OK` |
+| `MGET <k> ...` | one line per key |
+| `INCR` / `DECR <key>` | the new number |
+| `EXPIRE <key> <ms>` | `1` / `0` — TTL is in **milliseconds** |
+| `TTL <key>` | ms left, `-1` (no expiry), `-2` (no key) |
+| `RANGE <start> <end>` | matching keys sorted, then `END` |
+| `HSET <key> <field> <value>` | `1` |
+| `HGET <key> <field>` | the value, or empty |
+| `HGETALL <key>` | `field value` per line, then `END` |
+| `LPUSH` / `RPUSH <key> <value>` | the list's new length |
+| `LPOP` / `RPOP <key>` | the element removed |
+| `LRANGE <key> <start> <stop>` | elements, then `END`; `-1` means last |
+| `BEGIN` / `COMMIT` / `ABORT` | `OK` |
+| `FLUSHDB` | `OK` |
+| `EXIT` | quits |
+
+RANGE bounds are inclusive. An empty bound (`""`) means no limit on that
+side. Using the wrong command for a type (like `LPUSH` on a string) returns
+`ERR wrong type` instead of wrecking the value.
+
+## Testing
+
+```bash
+pip install -r requirements.txt
+flake8 .
+pytest -q
+```
+
+- `tests/test_hashtable.py` — the hash table on its own, including two keys
+  colliding into the same bucket.
+- `tests/test_store.py` — the value types, including that `clone()` really
+  is a deep copy, since transaction rollback depends on it.
+- `tests/test_cli.py` — runs the actual program as a subprocess and pipes
+  commands in, including restarting it to check that data persisted and that
+  an aborted transaction stayed aborted.
+
+GitHub Actions runs flake8 and the tests on every push.

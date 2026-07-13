@@ -1,392 +1,574 @@
+"""A persistent key-value store with a line-oriented command interface.
 
+Reads one command per line from STDIN and writes the result to STDOUT, so
+the program works both interactively and when driven by an automated
+black-box tester.
+
+Architecture
+------------
+The program is split so that each module has a single concern:
+
+``hashtable.py``
+    A hand-written hash table. The project forbids relying on the
+    language's built-in map types, so the index is implemented from
+    scratch with separate chaining and resizing.
+``store.py``
+    The typed values a key can hold -- string, hash, or list -- each
+    tagged with its type and an optional expiry.
+``persistence.py``
+    The append-only log that makes the data durable.
+``main.py``
+    This module: parses commands, dispatches them, and coordinates the
+    in-memory store with the on-disk log.
+
+Two details matter when a client is waiting on a reply:
+
+* Input is read with ``sys.stdin.readline()`` rather than by iterating the
+  file object. Iteration uses an internal read-ahead buffer, so Python
+  would not hand over the first line until it had read a large chunk or
+  seen end-of-input -- a client that writes one command and waits for its
+  answer would hang forever.
+* Every response is flushed the moment it is written. Python block-buffers
+  stdout when it is a pipe, so an unflushed reply would sit in memory
+  where the caller could never see it.
+"""
 
 import sys
 import time
+from typing import List, Optional
 
 from hashtable import HashTable
-from persistence import Log
-from store import new_string, new_hash, new_list, STRING, HASH, LIST
+from persistence import Log, Record
+from store import (
+    HASH,
+    LIST,
+    STRING,
+    Value,
+    new_hash,
+    new_list,
+    new_string,
+)
 
-store = HashTable()
-log = Log("data.db")
+DB_PATH = "data.db"
 
-in_transaction = False
-txn_buffer = []      # log records waiting to be committed
-snapshot = None      # copy of the store, for rollback
+# Responses. A missing key answers with an empty line; multi-line answers
+# are terminated by END so a caller knows the reply is complete.
+OK = "OK"
+NIL = ""
+END = "END"
+ERR_TYPE = "ERR wrong type"
+ERR_ARGS = "ERR wrong number of arguments"
+ERR_INT = "ERR value is not an integer"
+ERR_UNKNOWN = "ERR unknown command"
+ERR_NO_TXN = "ERR no transaction in progress"
+ERR_IN_TXN = "ERR already in a transaction"
+
+MILLIS_PER_SECOND = 1000.0
 
 
-def out(text):
-    """Write one response line and flush it immediately."""
-    sys.stdout.write(str(text) + "\n")
-    sys.stdout.flush()
+def unquote(token: str) -> str:
+    """Strip a matching pair of surrounding quotes from ``token``.
 
-
-def unquote(token):
-    """Strip surrounding quotes. A bare ''"" '' means an empty bound."""
+    A range query may be given an empty bound, written literally as ``""``,
+    meaning "unbounded on this side".
+    """
     if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
         return token[1:-1]
     return token
 
 
-def apply_record(record):
-    """Re-apply one logged record to memory. Does NOT write to the log."""
-    action = record[0]
-    if action == "SET":
-        store.set(record[1], new_string(record[2]))
-    elif action == "DEL":
-        store.delete(record[1])
-    elif action == "HSET":
-        item = store.get(record[1])
-        if item is None or item.vtype != HASH:
-            item = new_hash()
-            store.set(record[1], item)
-        item.data.set(record[2], record[3])
-    elif action == "LPUSH" or action == "RPUSH":
-        item = store.get(record[1])
-        if item is None or item.vtype != LIST:
-            item = new_list()
-            store.set(record[1], item)
-        if action == "LPUSH":
-            item.data.insert(0, record[2])
-        else:
-            item.data.append(record[2])
-    elif action == "LPOP" or action == "RPOP":
-        item = store.get(record[1])
-        if item is not None and item.vtype == LIST and item.data:
-            if action == "LPOP":
-                item.data.pop(0)
+class Database:
+    """The key-value store: an in-memory index backed by an append-only log.
+
+    Writes are applied to the index and simultaneously recorded in the log,
+    except while a transaction is open, when log records are buffered until
+    the transaction commits.
+    """
+
+    def __init__(self, log: Log) -> None:
+        self._index = HashTable()
+        self._log = log
+
+        # Transaction state. ``_snapshot`` is a deep copy of the index taken
+        # at BEGIN so that ABORT can restore it; ``_buffer`` holds the log
+        # records an open transaction has produced but not yet committed.
+        self._in_transaction = False
+        self._buffer: List[Record] = []
+        self._snapshot: Optional[HashTable] = None
+
+    # ---------------------------------------------------------------- #
+    # startup
+    # ---------------------------------------------------------------- #
+    def load(self) -> None:
+        """Rebuild the index from the log, then discard expired keys."""
+        self._log.replay(self._apply)
+        for key in list(self._index.keys()):
+            self._live(key)          # drops anything already past its expiry
+
+    def _apply(self, record: Record) -> None:
+        """Re-apply one logged record to memory during replay.
+
+        This deliberately does not write to the log. Replay reconstructs
+        history; recording it again would double the file on every restart.
+        """
+        action = record[0]
+
+        if action == "SET":
+            self._index.set(record[1], new_string(record[2]))
+
+        elif action == "DEL":
+            self._index.delete(record[1])
+
+        elif action == "HSET":
+            item = self._index.get(record[1])
+            if item is None or item.vtype != HASH:
+                item = new_hash()
+                self._index.set(record[1], item)
+            item.data.set(record[2], record[3])
+
+        elif action in ("LPUSH", "RPUSH"):
+            item = self._index.get(record[1])
+            if item is None or item.vtype != LIST:
+                item = new_list()
+                self._index.set(record[1], item)
+            if action == "LPUSH":
+                item.data.insert(0, record[2])
             else:
-                item.data.pop()
-    elif action == "EXPIRE":
-        item = store.get(record[1])
-        if item is not None:
-            item.expires_at = record[2]
-    elif action == "FLUSHDB":
-        store.clear()
+                item.data.append(record[2])
 
+        elif action in ("LPOP", "RPOP"):
+            item = self._index.get(record[1])
+            if item is not None and item.vtype == LIST and item.data:
+                if action == "LPOP":
+                    item.data.pop(0)
+                else:
+                    item.data.pop()
 
-def get_live(key):
-    """Get a key, treating expired keys as if they don't exist."""
-    item = store.get(key)
-    if item is None:
-        return None
-    if item.expires_at is not None and time.time() >= item.expires_at:
-        store.delete(key)      # it's dead -- clean it up now
-        return None
-    return item
+        elif action == "EXPIRE":
+            item = self._index.get(record[1])
+            if item is not None:
+                item.expires_at = record[2]      # an absolute deadline
 
+        elif action == "FLUSHDB":
+            self._index.clear()
 
-def write_log(record):
-    """Log a change -- or buffer it if we're inside a transaction."""
-    if in_transaction:
-        txn_buffer.append(record)
-    else:
-        log.append(record)
+    # ---------------------------------------------------------------- #
+    # internal helpers
+    # ---------------------------------------------------------------- #
+    def _live(self, key: str) -> Optional[Value]:
+        """Look up a key, treating an expired one as though it were absent.
 
-
-def handle(parts):
-    """Run one parsed command. Returns False when the program should stop."""
-    global in_transaction, txn_buffer, snapshot, store
-
-    command = parts[0].upper()
-
-    if command == "EXIT":
-        return False
-
-    elif command == "SET":
-        key = parts[1]
-        value = parts[2]
-        store.set(key, new_string(value))
-        write_log(["SET", key, value])
-        out("OK")
-
-    elif command == "GET":
-        key = parts[1]
-        item = get_live(key)
+        Expiry is evaluated lazily rather than enforced by a background
+        timer: a key is checked whenever it is touched, and dropped at that
+        moment if its deadline has passed. Every read goes through here, so
+        no command can ever observe a dead key.
+        """
+        item = self._index.get(key)
         if item is None:
-            out("")                            # missing key -> empty response
-        elif item.vtype != STRING:
-            out("ERR wrong type")
+            return None
+        if item.expires_at is not None and time.time() >= item.expires_at:
+            self._index.delete(key)
+            return None
+        return item
+
+    def _record(self, record: Record) -> None:
+        """Log a mutation, or buffer it if a transaction is open.
+
+        Buffering is what keeps an aborted transaction out of the log
+        entirely: if its writes had already been appended, replaying the
+        log after a restart would silently reinstate the changes the abort
+        was supposed to undo.
+        """
+        if self._in_transaction:
+            self._buffer.append(record)
         else:
-            out(item.data)
+            self._log.append(record)
 
-    elif command == "DEL":
-        key = parts[1]
-        if get_live(key) is not None and store.delete(key):
-            write_log(["DEL", key])
-            out("1")
-        else:
-            out("0")
+    # ---------------------------------------------------------------- #
+    # strings
+    # ---------------------------------------------------------------- #
+    def set(self, key: str, value: str) -> List[str]:
+        """Store a string value, replacing anything previously held."""
+        self._index.set(key, new_string(value))
+        self._record(["SET", key, value])
+        return [OK]
 
-    elif command == "EXISTS":
-        key = parts[1]
-        if get_live(key) is None:
-            out("0")
-        else:
-            out("1")
+    def get(self, key: str) -> List[str]:
+        """Return the string held at ``key``, or an empty reply if absent."""
+        item = self._live(key)
+        if item is None:
+            return [NIL]
+        if item.vtype != STRING:
+            return [ERR_TYPE]
+        return [item.data]
 
-    elif command == "MSET":
-        if len(parts) < 3 or len(parts) % 2 == 0:
-            out("ERR wrong number of arguments")
-            return True
-        i = 1
-        while i < len(parts):
-            store.set(parts[i], new_string(parts[i + 1]))
-            write_log(["SET", parts[i], parts[i + 1]])
-            i = i + 2
-        out("OK")
+    def mset(self, pairs: List[str]) -> List[str]:
+        """Set several keys at once from a flat key/value argument list."""
+        if len(pairs) < 2 or len(pairs) % 2 != 0:
+            return [ERR_ARGS]
+        for position in range(0, len(pairs), 2):
+            self.set(pairs[position], pairs[position + 1])
+        return [OK]
 
-    elif command == "MGET":
-        for key in parts[1:]:
-            item = get_live(key)
+    def mget(self, keys: List[str]) -> List[str]:
+        """Return one line per key, empty for any that is missing."""
+        lines = []
+        for key in keys:
+            item = self._live(key)
             if item is None or item.vtype != STRING:
-                out("")                        # missing key -> empty response
+                lines.append(NIL)
             else:
-                out(item.data)
+                lines.append(item.data)
+        return lines
 
-    elif command == "INCR" or command == "DECR":
-        key = parts[1]
-        item = get_live(key)
+    def incr_by(self, key: str, delta: int) -> List[str]:
+        """Add ``delta`` to a numeric key, treating a missing key as zero.
+
+        Values are stored as text, so the current value is parsed, adjusted,
+        and written back as text. A key holding something non-numeric is an
+        error rather than a silent reset.
+        """
+        item = self._live(key)
 
         if item is None:
-            number = 0
+            current = 0                      # a missing counter starts at 0
         elif item.vtype != STRING:
-            out("ERR wrong type")
-            return True
+            return [ERR_TYPE]
         else:
             try:
-                number = int(item.data)
+                current = int(item.data)
             except ValueError:
-                out("ERR value is not an integer")
-                return True
+                return [ERR_INT]
 
-        if command == "INCR":
-            number = number + 1
-        else:
-            number = number - 1
+        updated = str(current + delta)
+        self._index.set(key, new_string(updated))
+        # The *result* is logged, not the operation, so that replay stays
+        # deterministic and never has to recompute anything.
+        self._record(["SET", key, updated])
+        return [updated]
 
-        store.set(key, new_string(str(number)))
-        write_log(["SET", key, str(number)])
-        out(number)
+    # ---------------------------------------------------------------- #
+    # existence, deletion, expiry
+    # ---------------------------------------------------------------- #
+    def delete(self, key: str) -> List[str]:
+        """Remove a key, reporting 1 if one was removed and 0 otherwise."""
+        if self._live(key) is not None and self._index.delete(key):
+            self._record(["DEL", key])
+            return ["1"]
+        return ["0"]
 
-    elif command == "EXPIRE":
-        key = parts[1]
-        millis = int(parts[2])                 # TTL is given in milliseconds
-        item = get_live(key)
+    def exists(self, key: str) -> List[str]:
+        """Report whether a live key is present."""
+        return ["1" if self._live(key) is not None else "0"]
+
+    def expire(self, key: str, millis: int) -> List[str]:
+        """Give a key a time-to-live, measured in milliseconds.
+
+        The deadline is stored as an absolute timestamp so that it keeps its
+        original meaning when the log is replayed after a restart.
+        """
+        item = self._live(key)
         if item is None:
-            out("0")
-        else:
-            deadline = time.time() + millis / 1000.0   # absolute death time
-            item.expires_at = deadline
-            write_log(["EXPIRE", key, deadline])
-            out("1")
+            return ["0"]
+        deadline = time.time() + millis / MILLIS_PER_SECOND
+        item.expires_at = deadline
+        self._record(["EXPIRE", key, deadline])
+        return ["1"]
 
-    elif command == "TTL":
-        key = parts[1]
-        item = get_live(key)
+    def ttl(self, key: str) -> List[str]:
+        """Report the milliseconds a key has left.
+
+        Returns -1 for a key that exists but never expires, and -2 for a key
+        that does not exist at all, so the two cases stay distinguishable.
+        """
+        item = self._live(key)
         if item is None:
-            out("-2")                          # no such key
-        elif item.expires_at is None:
-            out("-1")                          # exists, never expires
-        else:
-            remaining = int((item.expires_at - time.time()) * 1000)
-            if remaining < 0:
-                remaining = 0
-            out(remaining)                     # milliseconds remaining
+            return ["-2"]
+        if item.expires_at is None:
+            return ["-1"]
+        remaining = int((item.expires_at - time.time()) * MILLIS_PER_SECOND)
+        return [str(max(remaining, 0))]
 
-    elif command == "RANGE":
-        start = unquote(parts[1])
-        end = unquote(parts[2])
+    def key_range(self, start: str, end: str) -> List[str]:
+        """Return the live keys falling between two bounds, sorted.
+
+        Bounds are compared lexicographically and are inclusive. An empty
+        bound means unbounded on that side. The reply always ends with END
+        so a caller can tell an empty result from an unfinished one.
+        """
         matches = []
-        for key, item in list(store.items()):
-            if start != "" and key < start:    # "" = no lower bound
+        for key in list(self._index.keys()):
+            if start and key < start:
                 continue
-            if end != "" and key > end:        # "" = no upper bound
+            if end and key > end:
                 continue
-            if get_live(key) is not None:
+            if self._live(key) is not None:
                 matches.append(key)
-        for key in sorted(matches):
-            out(key)
-        out("END")                             # terminates the key list
+        return sorted(matches) + [END]
 
-    elif command == "HSET":
-        key = parts[1]
-        field = parts[2]
-        value = parts[3]
-        item = get_live(key)
+    # ---------------------------------------------------------------- #
+    # hashes
+    # ---------------------------------------------------------------- #
+    def hset(self, key: str, field: str, value: str) -> List[str]:
+        """Set a field inside a hash, creating the hash if it is new."""
+        item = self._live(key)
 
         if item is None:
-            item = new_hash()                  # first field -- create it
-            store.set(key, item)
+            item = new_hash()
+            self._index.set(key, item)
         elif item.vtype != HASH:
-            out("ERR wrong type")
-            return True
+            return [ERR_TYPE]
 
-        item.data.set(field, value)            # item.data IS a HashTable
-        write_log(["HSET", key, field, value])
-        out("1")
+        item.data.set(field, value)          # item.data is itself a HashTable
+        self._record(["HSET", key, field, value])
+        return ["1"]
 
-    elif command == "HGET":
-        key = parts[1]
-        field = parts[2]
-        item = get_live(key)
+    def hget(self, key: str, field: str) -> List[str]:
+        """Return one field of a hash, or an empty reply if it is absent."""
+        item = self._live(key)
+        if item is None:
+            return [NIL]
+        if item.vtype != HASH:
+            return [ERR_TYPE]
+        value = item.data.get(field)
+        return [value if value is not None else NIL]
+
+    def hgetall(self, key: str) -> List[str]:
+        """Return every field of a hash as ``field value`` lines, then END."""
+        item = self._live(key)
+        if item is None:
+            return [END]
+        if item.vtype != HASH:
+            return [ERR_TYPE]
+        lines = ["%s %s" % (field, value) for field, value in item.data.items()]
+        return lines + [END]
+
+    # ---------------------------------------------------------------- #
+    # lists
+    # ---------------------------------------------------------------- #
+    def push(self, key: str, value: str, front: bool) -> List[str]:
+        """Add a value to the front or back of a list, returning its length."""
+        item = self._live(key)
 
         if item is None:
-            out("")                            # missing key -> empty response
-        elif item.vtype != HASH:
-            out("ERR wrong type")
-        else:
-            value = item.data.get(field)
-            out(value if value is not None else "")
-
-    elif command == "HGETALL":
-        key = parts[1]
-        item = get_live(key)
-
-        if item is None:
-            out("END")
-        elif item.vtype != HASH:
-            out("ERR wrong type")
-        else:
-            for field, value in item.data.items():
-                out(field + " " + value)
-            out("END")
-
-    elif command == "LPUSH" or command == "RPUSH":
-        key = parts[1]
-        value = parts[2]
-        item = get_live(key)
-
-        if item is None:
-            item = new_list()                  # first push -- create it
-            store.set(key, item)
+            item = new_list()
+            self._index.set(key, item)
         elif item.vtype != LIST:
-            out("ERR wrong type")
-            return True
+            return [ERR_TYPE]
 
-        if command == "LPUSH":
-            item.data.insert(0, value)         # position 0 = the front
+        if front:
+            item.data.insert(0, value)
         else:
-            item.data.append(value)            # append = the back
+            item.data.append(value)
 
-        write_log([command, key, value])
-        out(len(item.data))
+        self._record(["LPUSH" if front else "RPUSH", key, value])
+        return [str(len(item.data))]
 
-    elif command == "LRANGE":
-        key = parts[1]
-        start = int(parts[2])
-        stop = int(parts[3])
-        item = get_live(key)
+    def pop(self, key: str, front: bool) -> List[str]:
+        """Remove and return an element from the front or back of a list."""
+        item = self._live(key)
 
         if item is None:
-            out("END")
-        elif item.vtype != LIST:
-            out("ERR wrong type")
-        else:
-            data = item.data
-            n = len(data)
+            return [NIL]
+        if item.vtype != LIST:
+            return [ERR_TYPE]
+        if not item.data:
+            return [NIL]
 
-            if start < 0:                      # -1 means "last"
-                start = max(n + start, 0)
-            if stop < 0:
-                stop = n + stop
-            if stop > n - 1:
-                stop = n - 1
+        value = item.data.pop(0) if front else item.data.pop()
+        self._record(["LPOP" if front else "RPOP", key])
+        return [value]
 
-            if start < n and start <= stop:
-                for i in range(start, stop + 1):   # stop is inclusive
-                    out(data[i])
-            out("END")
+    def lrange(self, key: str, start: int, stop: int) -> List[str]:
+        """Return a slice of a list, then END.
 
-    elif command == "LPOP" or command == "RPOP":
-        key = parts[1]
-        item = get_live(key)
-
+        Both ends are inclusive, and a negative index counts back from the
+        end, so ``0 -1`` means the whole list. Out-of-range bounds are
+        clamped rather than treated as errors.
+        """
+        item = self._live(key)
         if item is None:
-            out("")                            # nothing to pop
-        elif item.vtype != LIST:
-            out("ERR wrong type")
-        elif len(item.data) == 0:
-            out("")
-        else:
-            if command == "LPOP":
-                value = item.data.pop(0)       # remove from the front
-            else:
-                value = item.data.pop()        # remove from the back
-            write_log([command, key])
-            out(value)
+            return [END]
+        if item.vtype != LIST:
+            return [ERR_TYPE]
 
-    elif command == "FLUSHDB":
-        store.clear()
-        write_log(["FLUSHDB"])
-        out("OK")
+        data = item.data
+        length = len(data)
 
-    elif command == "BEGIN":
-        if in_transaction:
-            out("ERR already in a transaction")
-        else:
-            snapshot = HashTable()
-            for key, item in store.items():
-                snapshot.set(key, item.clone())    # deep copy every value
-            in_transaction = True
-            txn_buffer = []
-            out("OK")
+        if start < 0:
+            start = max(length + start, 0)
+        if stop < 0:
+            stop = length + stop
+        stop = min(stop, length - 1)
 
-    elif command == "COMMIT":
-        if not in_transaction:
-            out("ERR no transaction in progress")
-        else:
-            for record in txn_buffer:          # NOW write them to disk
-                log.append(record)
-            in_transaction = False
-            txn_buffer = []
-            snapshot = None
-            out("OK")
+        if start >= length or start > stop:
+            return [END]
+        return list(data[start:stop + 1]) + [END]
 
-    elif command == "ABORT":
-        if not in_transaction:
-            out("ERR no transaction in progress")
-        else:
-            store = snapshot                   # restore the old state
-            in_transaction = False
-            txn_buffer = []                    # discard buffered writes
-            snapshot = None
-            out("OK")
+    # ---------------------------------------------------------------- #
+    # management
+    # ---------------------------------------------------------------- #
+    def flush(self) -> List[str]:
+        """Delete every key in the database."""
+        self._index.clear()
+        self._record(["FLUSHDB"])
+        return [OK]
 
-    else:
-        out("ERR unknown command")
+    # ---------------------------------------------------------------- #
+    # transactions
+    # ---------------------------------------------------------------- #
+    def begin(self) -> List[str]:
+        """Open a transaction, snapshotting the index so ABORT can undo it.
 
-    return True
+        Each value is cloned rather than referenced, otherwise writes made
+        during the transaction would mutate the snapshot as well and leave
+        nothing to roll back to.
+        """
+        if self._in_transaction:
+            return [ERR_IN_TXN]
+
+        snapshot = HashTable()
+        for key, item in self._index.items():
+            snapshot.set(key, item.clone())
+
+        self._snapshot = snapshot
+        self._in_transaction = True
+        self._buffer = []
+        return [OK]
+
+    def commit(self) -> List[str]:
+        """Make the transaction permanent by flushing its buffered records."""
+        if not self._in_transaction:
+            return [ERR_NO_TXN]
+        self._log.append_many(self._buffer)
+        self._end_transaction()
+        return [OK]
+
+    def abort(self) -> List[str]:
+        """Undo the transaction by restoring the snapshot and dropping writes."""
+        if not self._in_transaction:
+            return [ERR_NO_TXN]
+        self._index = self._snapshot
+        self._end_transaction()
+        return [OK]
+
+    def _end_transaction(self) -> None:
+        """Clear the transaction state after a commit or abort."""
+        self._in_transaction = False
+        self._buffer = []
+        self._snapshot = None
 
 
-def main():
-    log.replay(apply_record)           # rebuild state from last run
+class Session:
+    """Parses command lines and dispatches them to a :class:`Database`."""
 
-    for key, item in list(store.items()):
-        get_live(key)                  # drop anything already expired
+    def __init__(self, database: Database) -> None:
+        self._db = database
 
-    log.open_for_append()              # then start appending new writes
+    def execute(self, line: str) -> Optional[List[str]]:
+        """Run one command line.
 
-    while True:
-        line = sys.stdin.readline()    # one line at a time, no read-ahead
-        if line == "":                 # empty string means EOF
-            break
-
-        parts = line.strip().split()
+        Returns the lines to print, or None when the session should end.
+        A malformed command produces an error reply rather than raising,
+        so one bad line can never take down the whole session.
+        """
+        parts = line.split()
         if not parts:
-            continue
+            return []
+
+        command = parts[0].upper()
+        args = parts[1:]
+
+        if command == "EXIT":
+            return None
 
         try:
-            if not handle(parts):      # EXIT returns False
-                break
+            return self._dispatch(command, args)
         except IndexError:
-            out("ERR wrong number of arguments")
+            return [ERR_ARGS]
         except ValueError:
-            out("ERR invalid argument")
-        except Exception as exc:       # never let one bad command kill us
-            out("ERR " + str(exc))
+            return [ERR_INT]
 
-    log.close()
+    def _dispatch(self, command: str, args: List[str]) -> List[str]:
+        """Route a parsed command to the matching database operation."""
+        database = self._db
+
+        if command == "SET":
+            return database.set(args[0], args[1])
+        if command == "GET":
+            return database.get(args[0])
+        if command == "DEL":
+            return database.delete(args[0])
+        if command == "EXISTS":
+            return database.exists(args[0])
+        if command == "MSET":
+            return database.mset(args)
+        if command == "MGET":
+            return database.mget(args) if args else [ERR_ARGS]
+        if command == "INCR":
+            return database.incr_by(args[0], 1)
+        if command == "DECR":
+            return database.incr_by(args[0], -1)
+        if command == "EXPIRE":
+            return database.expire(args[0], int(args[1]))
+        if command == "TTL":
+            return database.ttl(args[0])
+        if command == "RANGE":
+            return database.key_range(unquote(args[0]), unquote(args[1]))
+        if command == "HSET":
+            return database.hset(args[0], args[1], args[2])
+        if command == "HGET":
+            return database.hget(args[0], args[1])
+        if command == "HGETALL":
+            return database.hgetall(args[0])
+        if command == "LPUSH":
+            return database.push(args[0], args[1], front=True)
+        if command == "RPUSH":
+            return database.push(args[0], args[1], front=False)
+        if command == "LPOP":
+            return database.pop(args[0], front=True)
+        if command == "RPOP":
+            return database.pop(args[0], front=False)
+        if command == "LRANGE":
+            return database.lrange(args[0], int(args[1]), int(args[2]))
+        if command == "FLUSHDB":
+            return database.flush()
+        if command == "BEGIN":
+            return database.begin()
+        if command == "COMMIT":
+            return database.commit()
+        if command == "ABORT":
+            return database.abort()
+
+        return [ERR_UNKNOWN]
+
+
+def main() -> None:
+    """Rebuild state from the log, then serve commands until end of input."""
+    log = Log(DB_PATH)
+    database = Database(log)
+    database.load()             # replay history before accepting new writes
+    log.open_for_append()
+
+    session = Session(database)
+
+    try:
+        while True:
+            # readline() returns as soon as a line arrives, unlike iterating
+            # sys.stdin, which would buffer ahead and stall a waiting client.
+            line = sys.stdin.readline()
+            if line == "":                       # end of input
+                break
+
+            lines = session.execute(line.strip())
+            if lines is None:                    # EXIT
+                break
+
+            for output in lines:
+                sys.stdout.write(output + "\n")
+            sys.stdout.flush()                   # let the caller see the reply
+    finally:
+        log.close()
 
 
 if __name__ == "__main__":
