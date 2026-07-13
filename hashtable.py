@@ -1,20 +1,3 @@
-"""A hand-written hash table used as the store's in-memory index.
-
-The project requires that the index not rely on the language's built-in
-dictionary/map types, so this module implements one from scratch.
-
-Design
-------
-Storage is an array of *buckets* (a Python ``list``, which is a sequence
-rather than an associative map, so it is permitted). A key is converted to
-a bucket index by a hash function; because two different keys can hash to
-the same index, each bucket holds a short list of ``[key, value]`` pairs
-that is searched linearly. This strategy is called *separate chaining*.
-
-The table doubles its capacity once it grows past a load factor of 0.75,
-which keeps the average chain short and lookups close to O(1). Without
-resizing, every operation would degrade toward O(n) as keys accumulated.
-"""
 
 from typing import Any, Iterator, List, Optional, Tuple
 

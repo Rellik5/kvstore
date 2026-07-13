@@ -1,18 +1,3 @@
-"""Typed values held by the key-value store.
-
-A key does not simply map to a string: it may hold a string, a hash of
-field/value pairs, or an ordered list. Every stored item is therefore
-wrapped in a :class:`Value`, which carries the data alongside a tag naming
-its type and an optional expiry timestamp.
-
-The tag is what lets each command validate its input before acting. HGET
-on a key holding a list, for example, is a type error rather than a
-silently wrong answer.
-
-A hash's fields are themselves stored in a :class:`HashTable` -- the same
-index structure the top-level store uses -- so no built-in dictionary is
-required at any level.
-"""
 
 from typing import List, Optional, Union
 

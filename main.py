@@ -1,37 +1,4 @@
-"""A persistent key-value store with a line-oriented command interface.
 
-Reads one command per line from STDIN and writes the result to STDOUT, so
-the program works both interactively and when driven by an automated
-black-box tester.
-
-Architecture
-------------
-The program is split so that each module has a single concern:
-
-``hashtable.py``
-    A hand-written hash table. The project forbids relying on the
-    language's built-in map types, so the index is implemented from
-    scratch with separate chaining and resizing.
-``store.py``
-    The typed values a key can hold -- string, hash, or list -- each
-    tagged with its type and an optional expiry.
-``persistence.py``
-    The append-only log that makes the data durable.
-``main.py``
-    This module: parses commands, dispatches them, and coordinates the
-    in-memory store with the on-disk log.
-
-Two details matter when a client is waiting on a reply:
-
-* Input is read with ``sys.stdin.readline()`` rather than by iterating the
-  file object. Iteration uses an internal read-ahead buffer, so Python
-  would not hand over the first line until it had read a large chunk or
-  seen end-of-input -- a client that writes one command and waits for its
-  answer would hang forever.
-* Every response is flushed the moment it is written. Python block-buffers
-  stdout when it is a pipe, so an unflushed reply would sit in memory
-  where the caller could never see it.
-"""
 
 import sys
 import time
@@ -96,9 +63,7 @@ class Database:
         self._buffer: List[Record] = []
         self._snapshot: Optional[HashTable] = None
 
-    # ---------------------------------------------------------------- #
-    # startup
-    # ---------------------------------------------------------------- #
+   
     def load(self) -> None:
         """Rebuild the index from the log, then discard expired keys."""
         self._log.replay(self._apply)
@@ -152,9 +117,7 @@ class Database:
         elif action == "FLUSHDB":
             self._index.clear()
 
-    # ---------------------------------------------------------------- #
-    # internal helpers
-    # ---------------------------------------------------------------- #
+    
     def _live(self, key: str) -> Optional[Value]:
         """Look up a key, treating an expired one as though it were absent.
 
@@ -184,9 +147,7 @@ class Database:
         else:
             self._log.append(record)
 
-    # ---------------------------------------------------------------- #
-    # strings
-    # ---------------------------------------------------------------- #
+    
     def set(self, key: str, value: str) -> List[str]:
         """Store a string value, replacing anything previously held."""
         self._index.set(key, new_string(value))
@@ -247,9 +208,7 @@ class Database:
         self._record(["SET", key, updated])
         return [updated]
 
-    # ---------------------------------------------------------------- #
-    # existence, deletion, expiry
-    # ---------------------------------------------------------------- #
+    
     def delete(self, key: str) -> List[str]:
         """Remove a key, reporting 1 if one was removed and 0 otherwise."""
         if self._live(key) is not None and self._index.delete(key):
@@ -306,9 +265,7 @@ class Database:
                 matches.append(key)
         return sorted(matches) + [END]
 
-    # ---------------------------------------------------------------- #
-    # hashes
-    # ---------------------------------------------------------------- #
+    
     def hset(self, key: str, field: str, value: str) -> List[str]:
         """Set a field inside a hash, creating the hash if it is new."""
         item = self._live(key)
@@ -343,9 +300,7 @@ class Database:
         lines = ["%s %s" % (field, value) for field, value in item.data.items()]
         return lines + [END]
 
-    # ---------------------------------------------------------------- #
-    # lists
-    # ---------------------------------------------------------------- #
+    
     def push(self, key: str, value: str, front: bool) -> List[str]:
         """Add a value to the front or back of a list, returning its length."""
         item = self._live(key)
@@ -405,18 +360,14 @@ class Database:
             return [END]
         return list(data[start:stop + 1]) + [END]
 
-    # ---------------------------------------------------------------- #
-    # management
-    # ---------------------------------------------------------------- #
+    
     def flush(self) -> List[str]:
         """Delete every key in the database."""
         self._index.clear()
         self._record(["FLUSHDB"])
         return [OK]
 
-    # ---------------------------------------------------------------- #
-    # transactions
-    # ---------------------------------------------------------------- #
+    
     def begin(self) -> List[str]:
         """Open a transaction, snapshotting the index so ABORT can undo it.
 

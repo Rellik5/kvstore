@@ -1,29 +1,4 @@
-"""Append-only durable log.
 
-Every mutation is appended to ``data.db`` as one JSON array per line::
-
-    ["SET", "user:1", "alice"]
-    ["EXPIRE", "user:1", 1751900000.0]
-    ["FLUSHDB"]
-
-Nothing already written is ever modified or rewritten in place. That is
-what makes the format crash-safe: an interrupted write can only ever
-damage the final line, leaving every earlier record intact. On startup the
-file is replayed in order to rebuild the in-memory index, and because the
-index enforces last-write-wins, replaying the history in sequence
-reproduces exactly the state the store had when it stopped.
-
-Records are JSON *arrays* rather than objects so that the on-disk format
-does not depend on any map type, and so that values containing spaces or
-quotes survive a round trip unharmed.
-
-Durability: each record is flushed to the operating system as soon as it
-is written. ``os.fsync`` is deliberately not called per write -- forcing a
-physical disk commit can stall for hundreds of milliseconds on some
-filesystems, long enough to make the command loop unresponsive to an
-interactive client, and flushing already protects the data against a
-process crash.
-"""
 
 import json
 import os
