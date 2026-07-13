@@ -50,6 +50,8 @@ def get_live(key):
         store.delete(key)      # it's dead -- clean it up now
         return None
     return item
+
+
 def write_log(record):
     """Log a change -- or buffer it if we're inside a transaction."""
     if in_transaction:

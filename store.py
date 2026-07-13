@@ -12,7 +12,8 @@ class Value:
     def __init__(self, vtype, data, expires_at=None):
         self.vtype = vtype           # "string", "hash", or "list"
         self.data = data             # a str, a HashTable, or a Python list
-        self.expires_at = expires_at # absolute unix time, or None = never
+        self.expires_at = expires_at  # absolute unix time, or None = never
+
     def clone(self):
         """Deep copy, so a snapshot can't be mutated by later changes."""
         if self.vtype == HASH:
