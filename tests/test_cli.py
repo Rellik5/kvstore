@@ -32,7 +32,7 @@ def test_counters(tmp_path):
 
 def test_lists(tmp_path):
     out = run(["RPUSH l b", "LPUSH l a", "LRANGE l 0 -1", "EXIT"], tmp_path)
-    assert out == ["1", "2", "a", "b"]
+    assert out == ["1", "2", "a", "b", "END"]   # END terminates the list
 
 
 def test_hashes(tmp_path):
@@ -57,3 +57,12 @@ def test_abort_rolls_back(tmp_path):
 def test_commit_persists(tmp_path):
     run(["BEGIN", "SET k saved", "COMMIT", "EXIT"], tmp_path)
     assert run(["GET k", "EXIT"], tmp_path) == ["saved"]
+
+def test_range_ends_with_end_marker(tmp_path):
+    out = run(["MSET b bb c cc d dd", "RANGE b d", "EXIT"], tmp_path)
+    assert out == ["OK", "b", "c", "d", "END"]
+
+
+def test_malformed_input_does_not_crash(tmp_path):
+    out = run(["GET", "BOGUS", "SET k v", "GET k", "EXIT"], tmp_path)
+    assert out[-1] == "v"      # process survived the bad commands
