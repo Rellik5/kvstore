@@ -1,3 +1,18 @@
+"""Simple persistent key-value store.
+
+Reads one command per line from STDIN and writes results to STDOUT, so it
+works interactively and when driven by an automated black-box tester.
+
+Two details matter for interactive clients:
+
+* Input is read with ``sys.stdin.readline()`` rather than ``for line in
+  sys.stdin``. Iterating the file object uses an internal read-ahead
+  buffer, so Python will not hand us the first line until it has read a
+  large chunk or seen EOF -- a client that writes one command and waits
+  for a reply would hang forever.
+* Every response is flushed immediately. When stdout is a pipe, Python
+  buffers it by default, so a waiting client would never see the reply.
+"""
 
 import sys
 import time
@@ -89,7 +104,7 @@ def handle(parts):
         key = parts[1]
         item = get_live(key)
         if item is None:
-            out("(nil)")
+            out("")                            # missing key -> empty response
         elif item.vtype != STRING:
             out("ERR wrong type")
         else:
@@ -125,7 +140,7 @@ def handle(parts):
         for key in parts[1:]:
             item = get_live(key)
             if item is None or item.vtype != STRING:
-                out("(nil)")
+                out("")                        # missing key -> empty response
             else:
                 out(item.data)
 
@@ -213,12 +228,12 @@ def handle(parts):
         item = get_live(key)
 
         if item is None:
-            out("(nil)")
+            out("")                            # missing key -> empty response
         elif item.vtype != HASH:
             out("ERR wrong type")
         else:
             value = item.data.get(field)
-            out(value if value is not None else "(nil)")
+            out(value if value is not None else "")
 
     elif command == "HGETALL":
         key = parts[1]
@@ -351,5 +366,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()

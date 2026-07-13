@@ -23,7 +23,7 @@ def test_set_and_get(tmp_path):
 
 
 def test_missing_key(tmp_path):
-    assert run(["GET nope", "EXIT"], tmp_path) == ["(nil)"]
+    assert run(["GET nope", "EXIT"], tmp_path) == [""]   # missing key -> empty
 
 
 def test_counters(tmp_path):
